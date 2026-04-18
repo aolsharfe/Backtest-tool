@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BACKTEST 回測記錄系統</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #09090b; }
+    select { cursor: pointer; }
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+const { useState, useEffect } = React;
+const XLSX_LIB = window.XLSX;
+
+
+const BAR_OPTIONS = ["1", "2", "3", "4", "4+"];
+
+const PERCENT_OPTIONS = [
+  { label: "0.167%", value: 0.167 },
+  { label: "0.088%", value: 0.088 },
+  { label: "0.200%", value: 0.200 },
+  { label: "1.000%", value: 1.000 },
+];
+
+const YEARS = Array.from({ length: 21 }, (_, i) => 2006 + i);
+const MONTHS = Array.from({ length: 12 }, (_, i) => i + 1);
+const DAYS = Array.from({ length: 31 }, (_, i) => i + 1);
+
+const selectClass = "w-full bg-zinc-800 border border-zinc-700 rounded-xl px-2 py-2 text-amber-400 text-sm font-mono font-bold text-center focus:outline-none focus:border-amber-500/70";
+
+const emptyRow = () => ({
+  id: Date.now() + Math.random(),
+  direction: "L",
+  grids: "",
+  entryBar: "",
+  exitBar: "",
+});
+
+const emptySession = () => ({
+  year: new Date().getFullYear(),
+  month: new Date().getMonth() + 1,
+  day: new Date().getDate(),
+  pctRate: 0.167,
+  rows: Array.from({ length: 4 }, emptyRow),
+});
+
+const calcPnL = (grids, pctRate) => {
+  const g = parseFloat(grids);
+  const p = parseFloat(pctRate);
+  if (!grids || isNaN(g) || isNaN(p)) return null;
+  return g * p;
+};
+
+const STORAGE_KEY = "backtest_trades_v4";
+
+async function loadAll() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch { return []; }
+}
+
+async function saveAll(records) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(records));
+  } catch (e) { console.error(e); }
+}
+
+function calcMonthlyCompound(records, year, month) {
+  const days = records
+    .filter(r => r.year === year && r.month === month)
+    .sort((a, b) => a.day - b.day);
+  if (days.length === 0) return null;
+  let compound = 1;
+  const steps = days.map(rec => {
+    const dayPnl = rec.rows.reduce((acc, r) => acc + (calcPnL(r.grids, rec.pctRate) || 0), 0);
+    compound *= (1 + dayPnl / 100);
+    return { day: rec.day, dayPnl, compound: (compound - 1) * 100 };
+  });
+  return { steps, totalCompound: (compound - 1) * 100 };
+}
+
+// ── Excel 匯出 ──
+function exportToExcel(records) {
+  const wb = XLSX_LIB.utils.book_new();
+  const pctFmt = "0.000%";
+
+  // 排序 records 依日期
+  const sorted = [...records].sort((a, b) => {
+    const ka = `${a.year}${String(a.month).padStart(2,"0")}${String(a.day).padStart(2,"0")}`;
+    const kb = `${b.year}${String(b.month).padStart(2,"0")}${String(b.day).padStart(2,"0")}`;
+    return ka.localeCompare(kb);
+  });
+
+  // ── 建立 dayMap（每日交易聚合）──
+  const dayMap = {};
+  sorted.forEach(rec => {
+    const key = `${rec.year}/${String(rec.month).padStart(2,"0")}/${String(rec.day).padStart(2,"0")}`;
+    if (!dayMap[key]) dayMap[key] = { year: rec.year, month: rec.month, day: rec.day, pctRate: rec.pctRate, trades: [] };
+    rec.rows.forEach(r => {
+      if (!r.grids) return;
+      const pnl = calcPnL(r.grids, rec.pctRate);
+      if (pnl !== null) dayMap[key].trades.push({ pnl, direction: r.direction });
+    });
+  });
+
+  // ── 建立月複利 map ──
+  const monthSet = [...new Set(sorted.map(r => `${r.year}-${String(r.month).padStart(2,"0")}`))].sort();
+  // key: "YYYY/MM/DD" → { dayPnl, compound }
+  const compoundByDay = {};
+  monthSet.forEach(ym => {
+    const [y, m] = ym.split("-").map(Number);
+    const res = calcMonthlyCompound(records, y, m);
+    if (!res) return;
+    res.steps.forEach(s => {
+      const key = `${y}/${String(m).padStart(2,"0")}/${String(s.day).padStart(2,"0")}`;
+      compoundByDay[key] = { dayPnl: s.dayPnl, compound: s.compound };
+    });
+  });
+
+  // ── Sheet 1: 逐筆明細 ──
+  // 欄位：日期|年|月|日|每格%|交易序號|方向|格數|損益%|進場K棒|出場K棒|當日總損益%|當月累積複利%
+  const detailHeaders = [
+    "日期","年","月","日","每格%","交易序號","方向","格數","損益%","進場K棒","出場K棒",
+    "當日總損益%","當月累積複利%"
+  ];
+  const detailRows = [];
+
+  sorted.forEach(rec => {
+    const dateStr = `${rec.year}/${String(rec.month).padStart(2,"0")}/${String(rec.day).padStart(2,"0")}`;
+    const dayKey = dateStr;
+    const dayTotal = (dayMap[dayKey]?.trades || []).reduce((a, t) => a + t.pnl, 0);
+    const compound = compoundByDay[dayKey]?.compound ?? "";
+
+    // 只輸出有格數的列
+    const validRows = rec.rows.filter(r => r.grids !== "" && r.grids !== undefined);
+
+    validRows.forEach((r, i) => {
+      const pnl = calcPnL(r.grids, rec.pctRate);
+      // 當日總損益 & 累積複利只在該日第一筆顯示
+      detailRows.push([
+        dateStr, rec.year, rec.month, rec.day,
+        rec.pctRate / 100,
+        i + 1,                              // 自動序號：1, 2, 3...
+        r.direction,
+        parseFloat(r.grids),
+        pnl !== null ? pnl / 100 : "",
+        r.entryBar || "", r.exitBar || "",
+        i === 0 ? dayTotal / 100 : "",      // 當日總損益只在首筆顯示
+        i === 0 ? compound / 100 : "",      // 當月累積複利只在首筆顯示
+      ]);
+    });
+  });
+
+  const ws1 = XLSX_LIB.utils.aoa_to_sheet([detailHeaders, ...detailRows]);
+  ws1["!cols"] = [
+    {wch:12},{wch:6},{wch:6},{wch:6},{wch:10},{wch:10},{wch:6},{wch:8},
+    {wch:10},{wch:10},{wch:10},{wch:14},{wch:14}
+  ];
+  for (let r = 1; r <= detailRows.length; r++) {
+    [4, 8, 11, 12].forEach(c => {
+      const cell = XLSX_LIB.utils.encode_cell({r, c});
+      if (ws1[cell] && typeof ws1[cell].v === "number") ws1[cell].z = pctFmt;
+    });
+  }
+  XLSX_LIB.utils.book_append_sheet(wb, ws1, "逐筆明細");
+
+  // ── Sheet 2: 每日匯總 ──
+  const summaryHeaders = ["日期","年","月","日","每格%","交易筆數","多單(L)","空單(S)","當日總損益%","勝筆數","負筆數","勝率","當月累積複利%"];
+  const summaryRows = Object.entries(dayMap).sort().map(([date, d]) => {
+    const totalPnl = d.trades.reduce((a,t) => a + t.pnl, 0);
+    const wins = d.trades.filter(t => t.pnl > 0).length;
+    const compound = compoundByDay[date]?.compound ?? "";
+    return [
+      date, d.year, d.month, d.day, d.pctRate / 100,
+      d.trades.length,
+      d.trades.filter(t => t.direction === "L").length,
+      d.trades.filter(t => t.direction === "S").length,
+      totalPnl / 100, wins,
+      d.trades.filter(t => t.pnl <= 0).length,
+      d.trades.length > 0 ? wins / d.trades.length : 0,
+      compound !== "" ? compound / 100 : "",
+    ];
+  });
+  const ws2 = XLSX_LIB.utils.aoa_to_sheet([summaryHeaders, ...summaryRows]);
+  ws2["!cols"] = [{wch:12},{wch:6},{wch:6},{wch:6},{wch:10},{wch:10},{wch:8},{wch:8},{wch:12},{wch:8},{wch:8},{wch:8},{wch:14}];
+  for (let r = 1; r <= summaryRows.length; r++) {
+    [[4,pctFmt],[8,pctFmt],[11,"0.0%"],[12,pctFmt]].forEach(([c,fmt]) => {
+      const cell = XLSX_LIB.utils.encode_cell({r, c});
+      if (ws2[cell] && typeof ws2[cell].v === "number") ws2[cell].z = fmt;
+    });
+  }
+  XLSX_LIB.utils.book_append_sheet(wb, ws2, "每日匯總");
+
+  // ── Sheet 3: 月複利匯總 ──
+  const compoundSummaryRows = monthSet.map(ym => {
+    const [y, m] = ym.split("-").map(Number);
+    const res = calcMonthlyCompound(records, y, m);
+    const days = records.filter(r => r.year === y && r.month === m).length;
+    return [`${y}/${String(m).padStart(2,"0")}`, y, m, days, res ? res.totalCompound / 100 : 0];
+  });
+  const ws3 = XLSX_LIB.utils.aoa_to_sheet([["年月","年","月","交易天數","月複利損益%"], ...compoundSummaryRows]);
+  ws3["!cols"] = [{wch:10},{wch:6},{wch:6},{wch:10},{wch:14}];
+  for (let r = 1; r <= compoundSummaryRows.length; r++) {
+    const cell = XLSX_LIB.utils.encode_cell({r, c:4});
+    if (ws3[cell]) ws3[cell].z = pctFmt;
+  }
+  XLSX_LIB.utils.book_append_sheet(wb, ws3, "月複利匯總");
+
+  // ── Sheet 4: 總覽統計 ──
+  const allTrades = sorted.flatMap(rec =>
+    rec.rows.filter(r => r.grids).map(r => ({ pnl: calcPnL(r.grids, rec.pctRate) }))
+  );
+  const tp = allTrades.reduce((a,t) => a + (t.pnl||0), 0);
+  const wt = allTrades.filter(t => t.pnl > 0);
+  const lt = allTrades.filter(t => t.pnl <= 0);
+  const ws4 = XLSX_LIB.utils.aoa_to_sheet([
+    ["統計項目","數值"],
+    ["總交易筆數", allTrades.length],
+    ["總損益%", tp/100],
+    ["平均每筆損益%", allTrades.length ? tp/allTrades.length/100 : 0],
+    ["勝筆數", wt.length],
+    ["負筆數", lt.length],
+    ["勝率", allTrades.length > 0 ? wt.length/allTrades.length : 0],
+    ["平均獲利%（勝）", wt.length ? wt.reduce((a,t)=>a+t.pnl,0)/wt.length/100 : 0],
+    ["平均虧損%（負）", lt.length ? lt.reduce((a,t)=>a+t.pnl,0)/lt.length/100 : 0],
+    ["最大單筆獲利%", wt.length ? Math.max(...wt.map(t=>t.pnl))/100 : 0],
+    ["最大單筆虧損%", lt.length ? Math.min(...lt.map(t=>t.pnl))/100 : 0],
+    ["回測天數", Object.keys(dayMap).length],
+  ]);
+  ws4["!cols"] = [{wch:22},{wch:14}];
+  [2,3,7,8,9,10].forEach(r => {
+    const cell = XLSX_LIB.utils.encode_cell({r, c:1});
+    if (ws4[cell]) ws4[cell].z = pctFmt;
+  });
+  const wrc = XLSX_LIB.utils.encode_cell({r:6, c:1});
+  if (ws4[wrc]) ws4[wrc].z = "0.0%";
+  XLSX_LIB.utils.book_append_sheet(wb, ws4, "總覽統計");
+
+  // ── Blob 下載 ──
+  const wbout = XLSX_LIB.write(wb, { bookType: "xlsx", type: "array" });
+  const blob = new Blob([wbout], { type: "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const dateTag = new Date().toISOString().slice(0,10);
+  a.href = url;
+  a.download = `回測紀錄_${dateTag}.xlsx`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function BarSelector({ label, value, onChange }) {
+  return (
+    <div>
+      <label className="text-zinc-500 text-xs mb-1 block">{label}</label>
+      <div className="flex rounded-lg overflow-hidden border border-zinc-700">
+        {BAR_OPTIONS.map(b => (
+          <button key={b} onClick={() => onChange(value === b ? "" : b)}
+            className={`flex-1 py-1.5 text-xs font-mono font-bold transition-colors ${
+              value === b ? "bg-amber-600 text-amber-100" : "bg-zinc-800 text-zinc-500 hover:bg-zinc-700"
+            }`}>{b}</button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Tag({ children, color }) {
+  const colors = {
+    L: "bg-emerald-900/60 text-emerald-300 border border-emerald-600/40",
+    S: "bg-rose-900/60 text-rose-300 border border-rose-600/40",
+  };
+  return (
+    <span className={`inline-block px-1.5 py-0.5 rounded text-xs font-mono font-bold ${colors[color] || "bg-zinc-800 text-zinc-400"}`}>
+      {children}
+    </span>
+  );
+}
+
+function RowInput({ row, idx, pctRate, onChange }) {
+  const pnl = calcPnL(row.grids, pctRate);
+  return (
+    <div className="rounded-xl border border-zinc-700/60 bg-zinc-900/80 p-3 mb-2 shadow-sm">
+      <div className="flex items-center gap-2 mb-2">
+        <span className="text-zinc-500 text-xs font-mono w-6 shrink-0 text-center text-amber-600 font-bold">#{idx+1}</span>
+        <div className="flex rounded-lg overflow-hidden border border-zinc-700 shrink-0">
+          {["L","S"].map(d => (
+            <button key={d} onClick={() => onChange({ ...row, direction: d })}
+              className={`px-3 py-1.5 text-sm font-bold transition-colors ${
+                row.direction === d
+                  ? d === "L" ? "bg-emerald-700 text-emerald-100" : "bg-rose-700 text-rose-100"
+                  : "bg-zinc-800 text-zinc-500"
+              }`}>{d}</button>
+          ))}
+        </div>
+        <div className="ml-auto">
+          {pnl !== null
+            ? <span className={`text-xs font-mono font-bold ${pnl >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                {pnl >= 0 ? "+" : ""}{pnl.toFixed(3)}%
+              </span>
+            : <span className="text-zinc-600 text-xs">損益—</span>
+          }
+        </div>
+      </div>
+      <div className="mb-2">
+        <label className="text-zinc-500 text-xs mb-1 block">格數</label>
+        <input type="number"
+          className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-1.5 text-zinc-200 text-sm font-mono focus:outline-none focus:border-amber-500/70"
+          placeholder="格數" value={row.grids}
+          onChange={e => onChange({ ...row, grids: e.target.value })}
+        />
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <BarSelector label="進場K棒" value={row.entryBar} onChange={v => onChange({ ...row, entryBar: v })} />
+        <BarSelector label="出場K棒" value={row.exitBar} onChange={v => onChange({ ...row, exitBar: v })} />
+      </div>
+    </div>
+  );
+}
+
+function DailyTotal({ rows, pctRate }) {
+  const total = rows.reduce((acc, r) => acc + (calcPnL(r.grids, pctRate) || 0), 0);
+  return (
+    <div className={`mb-3 rounded-xl px-4 py-3 border ${total >= 0 ? "border-emerald-700/50 bg-emerald-900/20" : "border-rose-700/50 bg-rose-900/20"}`}>
+      <div className="flex items-center justify-between">
+        <span className="text-zinc-400 text-xs font-bold tracking-wider">當日總損益</span>
+        <span className={`font-mono font-bold text-lg ${total >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+          {total >= 0 ? "+" : ""}{total.toFixed(3)}%
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function MonthlyCompoundPanel({ records }) {
+  const monthSet = [...new Set(records.map(r => `${r.year}-${String(r.month).padStart(2,"0")}`))].sort().reverse().slice(0,6);
+  if (monthSet.length === 0) return null;
+  return (
+    <div className="mb-4">
+      <div className="text-zinc-400 text-xs font-bold tracking-wider mb-2">每月複利損益</div>
+      <div className="space-y-2">
+        {monthSet.map(ym => {
+          const [y,m] = ym.split("-").map(Number);
+          const res = calcMonthlyCompound(records, y, m);
+          if (!res) return null;
+          const { steps, totalCompound } = res;
+          const isPos = totalCompound >= 0;
+          return (
+            <div key={ym} className={`rounded-xl border px-4 py-3 ${isPos ? "border-emerald-700/40 bg-emerald-900/10" : "border-rose-700/40 bg-rose-900/10"}`}>
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-zinc-400 text-xs font-mono font-bold">{y}/{String(m).padStart(2,"0")}</span>
+                <span className={`font-mono font-bold text-base ${isPos ? "text-emerald-400" : "text-rose-400"}`}>
+                  {isPos ? "+" : ""}{totalCompound.toFixed(3)}%
+                </span>
+              </div>
+              <div className="flex gap-1 flex-wrap">
+                {steps.map((s,i) => (
+                  <div key={i} className="flex flex-col items-center" style={{minWidth:28}}>
+                    <div className={`text-xs font-mono ${s.dayPnl >= 0 ? "text-emerald-400" : "text-rose-400"}`}>{s.dayPnl >= 0 ? "▲" : "▼"}</div>
+                    <div className="text-zinc-600 text-xs font-mono">{s.day}</div>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-1 flex items-center gap-1 flex-wrap">
+                <span className="text-zinc-600 text-xs">累積：</span>
+                {steps.map((s,i) => (
+                  <span key={i} className={`text-xs font-mono ${s.compound >= 0 ? "text-emerald-500/70" : "text-rose-500/70"}`}>
+                    {s.compound >= 0 ? "+" : ""}{s.compound.toFixed(2)}%{i < steps.length-1 ? " →" : ""}
+                  </span>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function RecordCard({ record, onDelete }) {
+  const [open, setOpen] = useState(false);
+  const filled = record.rows.filter(r => r.grids);
+  const totalPnl = filled.reduce((acc, r) => acc + (calcPnL(r.grids, record.pctRate) || 0), 0);
+  return (
+    <div className="rounded-xl border border-zinc-700/50 bg-zinc-900/60 mb-3 overflow-hidden">
+      <div className="flex items-center justify-between px-4 py-3 cursor-pointer hover:bg-zinc-800/40 transition-colors"
+        onClick={() => setOpen(o => !o)}>
+        <div>
+          <span className="text-amber-400 font-mono font-bold text-sm">
+            {record.year}/{String(record.month).padStart(2,"0")}/{String(record.day).padStart(2,"0")}
+          </span>
+          <span className="text-zinc-600 text-xs ml-2">{record.pctRate}%</span>
+          <span className="text-zinc-500 text-xs ml-2">{filled.length}筆</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className={`font-mono text-sm font-bold ${totalPnl >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+            {totalPnl >= 0 ? "+" : ""}{totalPnl.toFixed(3)}%
+          </span>
+          <span className="text-zinc-600 text-xs">{open ? "▲" : "▼"}</span>
+        </div>
+      </div>
+      {open && (
+        <div className="px-4 pb-4 border-t border-zinc-800">
+          <div className="mt-3">
+            <div className="grid grid-cols-6 gap-1 text-zinc-600 text-xs font-mono mb-1 px-1">
+              <span>序號</span><span>方向</span><span>格數</span><span>損益%</span><span>進場</span><span>出場</span>
+            </div>
+            {filled.map((r, idx2) => {
+              const pnl = calcPnL(r.grids, record.pctRate);
+              return (
+                <div key={r.id} className="grid grid-cols-6 gap-1 text-xs font-mono bg-zinc-800/50 rounded-lg px-2 py-1.5 items-center mb-1">
+                  <span className="text-zinc-400">{idx2+1}</span>
+                  <Tag color={r.direction}>{r.direction}</Tag>
+                  <span className="text-zinc-300">{r.grids||"—"}</span>
+                  <span className={pnl !== null ? (pnl >= 0 ? "text-emerald-400" : "text-rose-400") : "text-zinc-600"}>
+                    {pnl !== null ? `${pnl>=0?"+":""}${pnl.toFixed(3)}` : "—"}
+                  </span>
+                  <span className="text-amber-500/80">{r.entryBar||"—"}</span>
+                  <span className="text-amber-500/80">{r.exitBar||"—"}</span>
+                </div>
+              );
+            })}
+          </div>
+          <button onClick={() => onDelete(record.id)} className="mt-3 text-xs text-rose-500/70 hover:text-rose-400 transition-colors">
+            刪除此紀錄
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function App() {
+  const [tab, setTab] = useState("entry");
+  const [session, setSession] = useState(emptySession());
+  const [records, setRecords] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [saved, setSaved] = useState(false);
+  const [exporting, setExporting] = useState(false);
+
+  useEffect(() => { loadAll().then(r => { setRecords(r); setLoading(false); }); }, []);
+
+  const updateRow = (idx, newRow) => {
+    setSession(s => { const rows = [...s.rows]; rows[idx] = newRow; return { ...s, rows }; });
+  };
+
+  const handleSave = async () => {
+    const newRecord = { id: Date.now(), ...session, savedAt: new Date().toISOString() };
+    const updated = [newRecord, ...records];
+    setRecords(updated);
+    await saveAll(updated);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+    setSession(emptySession());
+  };
+
+  const handleDelete = async (id) => {
+    const updated = records.filter(r => r.id !== id);
+    setRecords(updated);
+    await saveAll(updated);
+  };
+
+  const handleExport = () => {
+    setExporting(true);
+    try {
+      exportToExcel(records);
+    } catch(e) {
+      console.error(e);
+    }
+    setTimeout(() => setExporting(false), 1500);
+  };
+
+  const allTrades = records.flatMap(rec => rec.rows.filter(row => row.grids).map(r => ({
+    pnl: calcPnL(r.grids, rec.pctRate)
+  })));
+  const totalPnl = allTrades.reduce((acc, r) => acc + (r.pnl || 0), 0);
+  const wins = allTrades.filter(r => (r.pnl || 0) > 0);
+
+  return (
+    <div className="min-h-screen bg-zinc-950 text-zinc-100 pb-8" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
+      <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+
+      <div className="sticky top-0 z-10 bg-zinc-950/95 backdrop-blur border-b border-zinc-800 px-4 py-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-amber-400 font-bold text-base tracking-widest">BACKTEST</div>
+            <div className="text-zinc-600 text-xs">回測記錄系統</div>
+          </div>
+          <div className="flex gap-1">
+            {["entry","records"].map(t => (
+              <button key={t} onClick={() => setTab(t)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors ${
+                  tab === t ? "bg-amber-500 text-zinc-950" : "bg-zinc-800 text-zinc-400"}`}>
+                {t === "entry" ? "輸入" : `紀錄 (${records.length})`}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {tab === "entry" && (
+        <div className="px-4 py-4 max-w-lg mx-auto">
+
+          {/* 年月日 */}
+          <div className="grid grid-cols-3 gap-2 mb-3">
+            <div>
+              <label className="text-zinc-500 text-xs block mb-1">年</label>
+              <select className={selectClass} value={session.year}
+                onChange={e => setSession(s => ({ ...s, year: parseInt(e.target.value) }))}>
+                {YEARS.map(y => <option key={y} value={y}>{y}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="text-zinc-500 text-xs block mb-1">月</label>
+              <select className={selectClass} value={session.month}
+                onChange={e => setSession(s => ({ ...s, month: parseInt(e.target.value) }))}>
+                {MONTHS.map(m => <option key={m} value={m}>{m}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="text-zinc-500 text-xs block mb-1">日</label>
+              <select className={selectClass} value={session.day}
+                onChange={e => setSession(s => ({ ...s, day: parseInt(e.target.value) }))}>
+                {DAYS.map(d => <option key={d} value={d}>{d}</option>)}
+              </select>
+            </div>
+          </div>
+
+          {/* 每格% — 改為下拉選單 */}
+          <div className="mb-3 rounded-xl border border-zinc-700/80 bg-zinc-900/60 px-4 py-3">
+            <div className="text-zinc-400 text-xs mb-2 font-bold tracking-wider">每格百分比（當日共用）</div>
+            <select
+              className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2.5 text-sky-300 text-sm font-mono font-bold focus:outline-none focus:border-sky-500/70"
+              value={session.pctRate}
+              onChange={e => setSession(s => ({ ...s, pctRate: parseFloat(e.target.value) }))}
+            >
+              {PERCENT_OPTIONS.map(o => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* 當日總損益 */}
+          <DailyTotal rows={session.rows} pctRate={session.pctRate} />
+
+          {/* 交易列 */}
+          <div className="text-zinc-500 text-xs mb-3 flex justify-between items-center">
+            <span>交易列表（{session.rows.length}/12）</span>
+            {session.rows.length < 12 && (
+              <button onClick={() => setSession(s => ({ ...s, rows: [...s.rows, emptyRow()] }))}
+                className="text-amber-500 text-xs">+ 新增列</button>
+            )}
+          </div>
+
+          {session.rows.map((row, idx) => (
+            <RowInput key={row.id} row={row} idx={idx} pctRate={session.pctRate} onChange={newRow => updateRow(idx, newRow)} />
+          ))}
+
+          <button onClick={handleSave}
+            className={`w-full mt-4 py-3.5 rounded-xl font-bold text-sm tracking-widest transition-all ${
+              saved ? "bg-emerald-600 text-white" : "bg-amber-500 hover:bg-amber-400 text-zinc-950 active:scale-95"}`}>
+            {saved ? "✓ 已儲存" : "儲存本日紀錄"}
+          </button>
+        </div>
+      )}
+
+      {tab === "records" && (
+        <div className="px-4 py-4 max-w-lg mx-auto">
+          {records.length > 0 && (
+            <>
+              <div className="grid grid-cols-3 gap-2 mb-4">
+                {[
+                  { label:"總損益", val:`${totalPnl>=0?"+":""}${totalPnl.toFixed(3)}%`, color: totalPnl>=0?"text-emerald-400":"text-rose-400" },
+                  { label:"總交易", val:`${allTrades.length}筆`, color:"text-zinc-300" },
+                  { label:"勝率", val: allTrades.length?`${((wins.length/allTrades.length)*100).toFixed(1)}%`:"—", color:"text-amber-400" },
+                ].map(s => (
+                  <div key={s.label} className="bg-zinc-900/60 border border-zinc-800 rounded-xl p-3 text-center">
+                    <div className="text-zinc-500 text-xs mb-1">{s.label}</div>
+                    <div className={`font-mono font-bold text-sm ${s.color}`}>{s.val}</div>
+                  </div>
+                ))}
+              </div>
+
+              <MonthlyCompoundPanel records={records} />
+
+              <button onClick={handleExport} disabled={exporting}
+                className={`w-full mb-4 py-3 rounded-xl border font-bold text-sm tracking-wider transition-all active:scale-95 ${
+                  exporting
+                    ? "border-zinc-600 bg-zinc-800 text-zinc-500 cursor-wait"
+                    : "border-emerald-600/50 bg-emerald-900/20 hover:bg-emerald-900/40 text-emerald-400"
+                }`}>
+                {exporting ? "⏳ 產生中…" : "⬇ Export Excel（逐筆明細 + 每日匯總 + 月複利 + 總覽）"}
+              </button>
+            </>
+          )}
+
+          {loading ? (
+            <div className="text-zinc-600 text-center py-12 text-sm">載入中…</div>
+          ) : records.length === 0 ? (
+            <div className="text-zinc-700 text-center py-16 text-sm">
+              <div className="text-3xl mb-3">📋</div>
+              <div>尚無回測紀錄</div>
+            </div>
+          ) : records.map(r => <RecordCard key={r.id} record={r} onDelete={handleDelete} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+
+  </script>
+</body>
+</html>
